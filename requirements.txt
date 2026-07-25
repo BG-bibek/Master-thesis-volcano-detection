@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+pillow
+PyYAML
+tqdm
+timm
+webdataset
+huggingface_hub
+safetensors
