@@ -15,6 +15,7 @@ import random
 from glob import glob
 from pathlib import Path
 
+import albumentations as A
 import numpy as np
 import torch
 import webdataset as wds
@@ -68,7 +69,36 @@ def normalize(image, stats, timeseries_length=3):
     return torch.nan_to_num(image, nan=0.0, posinf=3.0, neginf=-3.0)
 
 
-def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False):
+def _make_augment_fn():
+    """
+    Build an augmentation callable that applies the same spatial transform to
+    all T timesteps simultaneously.  Image is [T*C, H, W] float32 (z-scored).
+
+    By stacking all 27 channels into a single [H, W, 27] array before calling
+    albumentations, every timestep gets the identical flip / rotation — which is
+    required for InSAR timeseries (you cannot mirror t=0 differently from t=1).
+
+    Transforms match Thalia's active augmentations (augmentation.json), minus
+    RandomResizedCrop (which changes apparent deformation scale and is harder to
+    justify geophysically for a thesis comparison).
+    """
+    transform = A.Compose([
+        A.HorizontalFlip(p=0.3),
+        A.VerticalFlip(p=0.3),
+        A.Rotate(limit=180, p=0.6),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+    ])
+
+    def apply(image):
+        # [T*C, H, W] → [H, W, T*C] for albumentations, then back
+        arr = image.numpy().transpose(1, 2, 0)
+        out = transform(image=arr)["image"]
+        return torch.from_numpy(np.ascontiguousarray(out.transpose(2, 0, 1)))
+
+    return apply
+
+
+def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False, augment_fn=None):
     """
     Decode one raw WebDataset dict into (image, label, meta).
 
@@ -87,6 +117,9 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False):
         binary_label = int(any(raw_label) if isinstance(raw_label, (list, tuple)) else raw_label)
 
         image = normalize(image, stats, timeseries_length)
+
+        if augment_fn is not None:
+            image = augment_fn(image)
 
         # Ablation: shuffle timestep order to destroy temporal information
         if shuffle_frames:
@@ -138,6 +171,7 @@ def create_loaders(
     num_workers=0,
     seed=42,
     shuffle_frames=False,
+    augment_pos=False,
 ):
     """
     Build train / val / test DataLoaders.
@@ -163,21 +197,30 @@ def create_loaders(
         stats = json.load(f)
     data_root = Path(data_root)
 
-    def decode_fn(raw):
-        return decode_sample(raw, stats, timeseries_length, shuffle_frames=shuffle_frames)
-
     # ── Train: separate pos/neg shards → RandomMix ──────────────────────
     pos_shards = sorted(glob(str(data_root / "train_pos" / "*.tar")))
     neg_shards = sorted(glob(str(data_root / "train_neg" / "*.tar")))
 
+    # Augmentation is applied ONLY to the positive (minority) class to increase
+    # diversity without generating new negative samples.
+    aug_fn = _make_augment_fn() if augment_pos else None
+
+    def decode_pos(raw):
+        return decode_sample(raw, stats, timeseries_length,
+                             shuffle_frames=shuffle_frames, augment_fn=aug_fn)
+
+    def decode_neg(raw):
+        return decode_sample(raw, stats, timeseries_length,
+                             shuffle_frames=shuffle_frames, augment_fn=None)
+
     pos_ds = (
         wds.WebDataset(pos_shards, shardshuffle=100)
-        .map(decode_fn)
+        .map(decode_pos)
         .select(lambda x: x is not None)
     )
     neg_ds = (
         wds.WebDataset(neg_shards, shardshuffle=100)
-        .map(decode_fn)
+        .map(decode_neg)
         .select(lambda x: x is not None)
     )
 
@@ -189,11 +232,15 @@ def create_loaders(
     )
 
     # ── Val / Test ───────────────────────────────────────────────────────
+    def decode_eval(raw):
+        return decode_sample(raw, stats, timeseries_length,
+                             shuffle_frames=False, augment_fn=None)
+
     def make_eval_loader(split):
         shards = sorted(glob(str(data_root / split / "*.tar")))
         ds = (
             wds.WebDataset(shards, shardshuffle=False)
-            .map(decode_fn)
+            .map(decode_eval)
             .select(lambda x: x is not None)
         )
         return DataLoader(

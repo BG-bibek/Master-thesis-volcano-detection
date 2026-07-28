@@ -10,3 +10,4 @@ timm
 webdataset
 huggingface_hub
 safetensors
+albumentations

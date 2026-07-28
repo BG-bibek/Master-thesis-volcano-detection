@@ -146,7 +146,7 @@ class CNNLSTMClassifier(nn.Module):
 # DATA LOADING
 # ============================================================================
 
-def create_loaders(data_root, stats_path, shuffle_frames=False, seed=42):
+def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=False):
     from data_loader_fixed import create_loaders as _create_loaders
     return _create_loaders(
         data_root=data_root,
@@ -154,8 +154,9 @@ def create_loaders(data_root, stats_path, shuffle_frames=False, seed=42):
         timeseries_length=3,
         batch_size=CFG['batch_size'],
         num_workers=4,  # start at 4; increase if stable, drop to 0 if hangs
-        seed=seed,
+        seed=42,
         shuffle_frames=shuffle_frames,
+        augment_pos=augment_pos,
     )
 
 
@@ -263,8 +264,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history):
 def load_checkpoint(path, model, optimizer, scheduler):
     """Load training state. Returns (start_epoch, best_f1, history)."""
     ckpt = torch.load(path, map_location=CFG['device'], weights_only=False)
-    load_target = model.module if isinstance(model, nn.DataParallel) else model
-    load_target.load_state_dict(ckpt['model_state_dict'])
+    model.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     if 'scheduler_state_dict' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
@@ -285,9 +285,10 @@ if __name__ == "__main__":
     parser.add_argument('--model',    default='cnn_lstm', choices=['baseline', 'cnn_lstm'])
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
     parser.add_argument('--shuffle',  action='store_true', help='Shuffle frames (ablation)')
+    parser.add_argument('--augment',  action='store_true',
+                        help='Apply spatial augmentation to train_pos only (addresses class imbalance)')
     parser.add_argument('--data_root',  default=DEFAULT_DATA_ROOT)
     parser.add_argument('--stats_path', default=DEFAULT_STATS_PATH)
-    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume',   action='store_true',
                         help='Resume from last checkpoint for this run, if it exists')
     parser.add_argument('--checkpoint_every', type=int, default=1,
@@ -301,7 +302,8 @@ if __name__ == "__main__":
     Path("outputs").mkdir(exist_ok=True)
 
     shuffle_tag      = "_shuffled" if args.shuffle else ""
-    run_name         = f"{CFG['model_name']}{shuffle_tag}"
+    aug_tag          = "_aug" if args.augment else ""
+    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}"
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
@@ -310,6 +312,8 @@ if __name__ == "__main__":
     print(f"Training: {run_name.upper()}  |  epochs={CFG['epochs']}")
     if args.shuffle:
         print("ABLATION MODE: frames are shuffled (temporal order destroyed)")
+    if args.augment:
+        print("AUGMENT MODE: spatial augmentation applied to train_pos only")
     print("=" * 70)
 
     # Verify paths before anything expensive
@@ -327,6 +331,7 @@ if __name__ == "__main__":
         data_root=args.data_root,
         stats_path=args.stats_path,
         shuffle_frames=args.shuffle,
+        augment_pos=args.augment,
     )
 
     # Print shard/sample counts so we know what data is being loaded
@@ -384,7 +389,7 @@ if __name__ == "__main__":
 
     # Resume logic
     start_epoch = 1
-    best_f1     = -1.0  # -1 guarantees checkpoint saved on epoch 1 even if F1=0%
+    best_f1     = 0.0
     history     = []
 
     if args.resume:
@@ -459,9 +464,8 @@ if __name__ == "__main__":
 
     # ── Final test set evaluation using best checkpoint ──────────────────
     print("\nRunning final test set evaluation (best checkpoint)...")
-    best_state  = torch.load(best_ckpt_path, map_location=CFG['device'], weights_only=True)
-    load_target = model.module if isinstance(model, nn.DataParallel) else model
-    load_target.load_state_dict(best_state)
+    best_state = torch.load(best_ckpt_path, map_location=CFG['device'], weights_only=True)
+    model.load_state_dict(best_state)
     test_metrics = evaluate(model, test_loader, criterion)
 
     print(f"  Test F1        : {test_metrics['f1']:6.2f}%")
@@ -479,4 +483,3 @@ if __name__ == "__main__":
 
     print(f"\nMetrics log: {metrics_log_path}")
     print("=" * 70)
-
