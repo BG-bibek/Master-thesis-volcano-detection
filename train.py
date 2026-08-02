@@ -146,7 +146,7 @@ class CNNLSTMClassifier(nn.Module):
 # DATA LOADING
 # ============================================================================
 
-def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=False):
+def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=False, channels='all'):
     from data_loader_fixed import create_loaders as _create_loaders
     return _create_loaders(
         data_root=data_root,
@@ -157,6 +157,7 @@ def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=Fals
         seed=42,
         shuffle_frames=shuffle_frames,
         augment_pos=augment_pos,
+        channels=channels,
     )
 
 
@@ -249,7 +250,7 @@ def _model_state(model):
     return model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
 
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history):
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history, channels):
     """Save full training state for exact resume."""
     torch.save({
         'epoch':                epoch,
@@ -258,12 +259,20 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history):
         'scheduler_state_dict': scheduler.state_dict(),
         'best_f1':              best_f1,
         'history':              history,
+        'channels':             channels,
     }, path)
 
 
-def load_checkpoint(path, model, optimizer, scheduler):
+def load_checkpoint(path, model, optimizer, scheduler, channels):
     """Load training state. Returns (start_epoch, best_f1, history)."""
     ckpt = torch.load(path, map_location=CFG['device'], weights_only=False)
+    ckpt_channels = ckpt.get('channels', 'all')
+    if ckpt_channels != channels:
+        raise ValueError(
+            f"Checkpoint at {path} was trained with channels='{ckpt_channels}', "
+            f"but this run is using channels='{channels}'. Refusing to load a "
+            "checkpoint with a mismatched channel count / input shape."
+        )
     model.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     if 'scheduler_state_dict' in ckpt:
@@ -287,6 +296,10 @@ if __name__ == "__main__":
     parser.add_argument('--shuffle',  action='store_true', help='Shuffle frames (ablation)')
     parser.add_argument('--augment',  action='store_true',
                         help='Apply spatial augmentation to train_pos only (addresses class imbalance)')
+    parser.add_argument('--channels', default='all', choices=['all', 'core'],
+                        help="'all' = 9 channels/timestep (27 total); "
+                             "'core' = insar_difference/insar_coherence/dem only "
+                             "(9 total) — ablation dropping the 6 atmospheric channels")
     parser.add_argument('--data_root',  default=DEFAULT_DATA_ROOT)
     parser.add_argument('--stats_path', default=DEFAULT_STATS_PATH)
     parser.add_argument('--resume',   action='store_true',
@@ -298,12 +311,14 @@ if __name__ == "__main__":
 
     CFG['model_name'] = args.model
     CFG['epochs']     = args.epochs
+    CFG['n_channels_per_timestep'] = 3 if args.channels == 'core' else 9
 
     Path("outputs").mkdir(exist_ok=True)
 
     shuffle_tag      = "_shuffled" if args.shuffle else ""
     aug_tag          = "_aug" if args.augment else ""
-    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}"
+    channels_tag     = "_core" if args.channels == 'core' else ""
+    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
@@ -314,6 +329,8 @@ if __name__ == "__main__":
         print("ABLATION MODE: frames are shuffled (temporal order destroyed)")
     if args.augment:
         print("AUGMENT MODE: spatial augmentation applied to train_pos only")
+    if args.channels == 'core':
+        print("CHANNEL ABLATION: core channels only (insar_difference, insar_coherence, dem)")
     print("=" * 70)
 
     # Verify paths before anything expensive
@@ -332,6 +349,7 @@ if __name__ == "__main__":
         stats_path=args.stats_path,
         shuffle_frames=args.shuffle,
         augment_pos=args.augment,
+        channels=args.channels,
     )
 
     # Print shard/sample counts so we know what data is being loaded
@@ -351,13 +369,17 @@ if __name__ == "__main__":
 
     # Create model
     print(f"\nCreating {CFG['model_name']} model...")
+    n_ch_per_frame = CFG['n_channels_per_timestep']  # 9 ('all') or 3 ('core')
     if CFG['model_name'] == 'baseline':
-        model = BaselineResNet50(in_channels=27, num_classes=CFG['num_classes'])
+        model = BaselineResNet50(
+            in_channels=n_ch_per_frame * CFG['timeseries_length'],
+            num_classes=CFG['num_classes'],
+        )
     elif CFG['model_name'] == 'cnn_lstm':
         model = CNNLSTMClassifier(
             backbone='resnet50',
-            in_channels_per_frame=9,
-            timeseries_len=3,
+            in_channels_per_frame=n_ch_per_frame,
+            timeseries_len=CFG['timeseries_length'],
             lstm_hidden=256,
             num_classes=CFG['num_classes'],
         )
@@ -395,7 +417,7 @@ if __name__ == "__main__":
     if args.resume:
         if Path(resume_ckpt_path).exists():
             start_epoch, best_f1, history = load_checkpoint(
-                resume_ckpt_path, model, optimizer, scheduler
+                resume_ckpt_path, model, optimizer, scheduler, args.channels
             )
         else:
             print(f"--resume passed but no checkpoint found at {resume_ckpt_path}. "
@@ -453,7 +475,8 @@ if __name__ == "__main__":
 
         if epoch % args.checkpoint_every == 0:
             save_checkpoint(
-                resume_ckpt_path, model, optimizer, scheduler, epoch, best_f1, history
+                resume_ckpt_path, model, optimizer, scheduler, epoch, best_f1, history,
+                args.channels
             )
 
     total_elapsed = time.time() - train_start

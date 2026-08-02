@@ -36,6 +36,22 @@ _CHANNELS_PER_TIMESTEP = [
 ]
 N_CHANNELS_PER_TIMESTEP = len(_CHANNELS_PER_TIMESTEP)  # 9
 
+# "core" channel ablation: keep only the geophysical channels per timestep
+# (insar_difference, insar_coherence, dem) and drop the 6 atmospheric ones.
+CORE_CHANNEL_IDX = [0, 1, 2]
+
+
+def _core_flat_idx(timeseries_length):
+    """Flattened indices of the core channels across all timesteps.
+
+    e.g. for timeseries_length=3: [0,1,2, 9,10,11, 18,19,20]
+    """
+    return [
+        t * N_CHANNELS_PER_TIMESTEP + c
+        for t in range(timeseries_length)
+        for c in CORE_CHANNEL_IDX
+    ]
+
 
 def _stats_key(ch_name):
     """Strip primary_date_ / secondary_date_ prefix for statistics.json lookup."""
@@ -98,13 +114,18 @@ def _make_augment_fn():
     return apply
 
 
-def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False, augment_fn=None):
+def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False,
+                  augment_fn=None, channels="all"):
     """
     Decode one raw WebDataset dict into (image, label, meta).
 
     Args:
         shuffle_frames: if True, randomly permute the T timesteps.
                         Used for the ablation experiment — proves ordering matters.
+        channels      : "all" keeps all 9 channels/timestep (27 total).
+                        "core" keeps only [insar_difference, insar_coherence, dem]
+                        per timestep (9 total) — ablation testing whether the
+                        6 atmospheric channels matter.
 
     Returns None on error so the pipeline can skip bad samples.
     """
@@ -116,6 +137,8 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False, augment
         raw_label    = meta.get("label", [0])
         binary_label = int(any(raw_label) if isinstance(raw_label, (list, tuple)) else raw_label)
 
+        # Normalize on the full 9-channel layout first so stats indexing stays
+        # correct, regardless of whether we slice channels down afterwards.
         image = normalize(image, stats, timeseries_length)
 
         if augment_fn is not None:
@@ -126,6 +149,9 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False, augment
             perm   = torch.randperm(timeseries_length)
             chunks = image.reshape(timeseries_length, N_CHANNELS_PER_TIMESTEP, *image.shape[1:])
             image  = chunks[perm].reshape(image.shape)
+
+        if channels == "core":
+            image = image[_core_flat_idx(timeseries_length)]
 
         return image, torch.tensor(binary_label, dtype=torch.long), meta
 
@@ -172,6 +198,7 @@ def create_loaders(
     seed=42,
     shuffle_frames=False,
     augment_pos=False,
+    channels="all",
 ):
     """
     Build train / val / test DataLoaders.
@@ -185,6 +212,8 @@ def create_loaders(
         num_workers       : 0 on Mac (multiprocessing issues with wds);
                             start with 4 on server, drop to 0 if hangs
         seed              : random seed
+        channels          : "all" (9 ch/timestep) or "core" (3 ch/timestep —
+                            drops the 6 atmospheric channels, ablation)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -207,11 +236,13 @@ def create_loaders(
 
     def decode_pos(raw):
         return decode_sample(raw, stats, timeseries_length,
-                             shuffle_frames=shuffle_frames, augment_fn=aug_fn)
+                             shuffle_frames=shuffle_frames, augment_fn=aug_fn,
+                             channels=channels)
 
     def decode_neg(raw):
         return decode_sample(raw, stats, timeseries_length,
-                             shuffle_frames=shuffle_frames, augment_fn=None)
+                             shuffle_frames=shuffle_frames, augment_fn=None,
+                             channels=channels)
 
     pos_ds = (
         wds.WebDataset(pos_shards, shardshuffle=100)
@@ -234,7 +265,8 @@ def create_loaders(
     # ── Val / Test ───────────────────────────────────────────────────────
     def decode_eval(raw):
         return decode_sample(raw, stats, timeseries_length,
-                             shuffle_frames=False, augment_fn=None)
+                             shuffle_frames=False, augment_fn=None,
+                             channels=channels)
 
     def make_eval_loader(split):
         shards = sorted(glob(str(data_root / split / "*.tar")))
@@ -266,6 +298,7 @@ if __name__ == "__main__":
         timeseries_length=3,
         batch_size=2,
         num_workers=0,
+        channels="all"  
     )
 
     print("=== Verifying train batch ===")
