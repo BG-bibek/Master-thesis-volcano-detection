@@ -90,19 +90,24 @@ def _make_augment_fn():
     Build an augmentation callable that applies the same spatial transform to
     all T timesteps simultaneously.  Image is [T*C, H, W] float32 (z-scored).
 
-    By stacking all 27 channels into a single [H, W, 27] array before calling
+    By stacking all channels into a single [H, W, T*C] array before calling
     albumentations, every timestep gets the identical flip / rotation — which is
     required for InSAR timeseries (you cannot mirror t=0 differently from t=1).
 
-    Transforms match Thalia's active augmentations (augmentation.json), minus
-    RandomResizedCrop (which changes apparent deformation scale and is harder to
-    justify geophysically for a thesis comparison).
+    Transforms are identical to Thalia's active augmentations (augmentation.json):
+      - HorizontalFlip      p=0.3
+      - VerticalFlip        p=0.3
+      - Rotate              p=0.6  (default limit ±90°, matching Thalia's A.Rotate(p=0.6))
+      - GaussianBlur        p=0.3  sigma=(0.1,2.0), default blur_limit (3,7)
+      - RandomResizedCrop   p=0.3  default scale (0.08,1.0)
+    Applied to ALL training samples (pos + neg), identical to Thalia's behaviour.
     """
     transform = A.Compose([
         A.HorizontalFlip(p=0.3),
         A.VerticalFlip(p=0.3),
-        A.Rotate(limit=180, p=0.6),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+        A.Rotate(p=0.6),                                  # default limit=(-90,90)
+        A.GaussianBlur(sigma_limit=(0.1, 2.0), p=0.3),   # default blur_limit=(3,7)
+        A.RandomResizedCrop(size=(512, 512), p=0.3),      # default scale=(0.08,1.0)
     ])
 
     def apply(image):
@@ -197,7 +202,7 @@ def create_loaders(
     num_workers=0,
     seed=42,
     shuffle_frames=False,
-    augment_pos=False,
+    augment=False,
     channels="all",
 ):
     """
@@ -212,8 +217,10 @@ def create_loaders(
         num_workers       : 0 on Mac (multiprocessing issues with wds);
                             start with 4 on server, drop to 0 if hangs
         seed              : random seed
-        channels          : "all" (9 ch/timestep) or "core" (3 ch/timestep —
-                            drops the 6 atmospheric channels, ablation)
+        augment           : if True, apply Thalia-identical spatial augmentation
+                            to all training samples (pos + neg)
+        channels          : "all" (9 ch/timestep, 27 total) or "core"
+                            (3 ch/timestep, 9 total — drops atmospheric channels)
 
     Returns:
         train_loader, val_loader, test_loader
@@ -230,28 +237,22 @@ def create_loaders(
     pos_shards = sorted(glob(str(data_root / "train_pos" / "*.tar")))
     neg_shards = sorted(glob(str(data_root / "train_neg" / "*.tar")))
 
-    # Augmentation is applied ONLY to the positive (minority) class to increase
-    # diversity without generating new negative samples.
-    aug_fn = _make_augment_fn() if augment_pos else None
+    # Augmentation applied to all training samples (pos + neg) — identical to Thalia.
+    aug_fn = _make_augment_fn() if augment else None
 
-    def decode_pos(raw):
+    def decode_train(raw):
         return decode_sample(raw, stats, timeseries_length,
                              shuffle_frames=shuffle_frames, augment_fn=aug_fn,
                              channels=channels)
 
-    def decode_neg(raw):
-        return decode_sample(raw, stats, timeseries_length,
-                             shuffle_frames=shuffle_frames, augment_fn=None,
-                             channels=channels)
-
     pos_ds = (
         wds.WebDataset(pos_shards, shardshuffle=100)
-        .map(decode_pos)
+        .map(decode_train)
         .select(lambda x: x is not None)
     )
     neg_ds = (
         wds.WebDataset(neg_shards, shardshuffle=100)
-        .map(decode_neg)
+        .map(decode_train)
         .select(lambda x: x is not None)
     )
 
@@ -298,7 +299,7 @@ if __name__ == "__main__":
         timeseries_length=3,
         batch_size=2,
         num_workers=0,
-        channels="all"  
+        channels="all",
     )
 
     print("=== Verifying train batch ===")

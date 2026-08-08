@@ -55,7 +55,7 @@ CFG = {
     'weight_decay': 1e-4,   # matches Thalia configs.json (was 1e-2 — 100x too high)
     'gradient_clip': 1.0,
     'timeseries_length': 3,
-    'n_channels_per_timestep': 9,  # 3 geo + 6 atm
+    'n_channels_per_timestep': 9,  # 3 geo + 6 atm; set to 3 when --channels=core
     'model_name': 'baseline',      # overridden by --model
 }
 
@@ -78,7 +78,7 @@ class BaselineResNet50(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, T*C, H, W) = (B, 27, 512, 512)
+        # x: (B, T*C, H, W) = (B, 27, 512, 512) for 'all', (B, 9, 512, 512) for 'core'
         return self.model(x)
 
 
@@ -146,7 +146,7 @@ class CNNLSTMClassifier(nn.Module):
 # DATA LOADING
 # ============================================================================
 
-def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=False, channels='all'):
+def create_loaders(data_root, stats_path, shuffle_frames=False, augment=False, channels='all'):
     from data_loader_fixed import create_loaders as _create_loaders
     return _create_loaders(
         data_root=data_root,
@@ -156,7 +156,7 @@ def create_loaders(data_root, stats_path, shuffle_frames=False, augment_pos=Fals
         num_workers=4,  # start at 4; increase if stable, drop to 0 if hangs
         seed=42,
         shuffle_frames=shuffle_frames,
-        augment_pos=augment_pos,
+        augment=augment,
         channels=channels,
     )
 
@@ -295,7 +295,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
     parser.add_argument('--shuffle',  action='store_true', help='Shuffle frames (ablation)')
     parser.add_argument('--augment',  action='store_true',
-                        help='Apply spatial augmentation to train_pos only (addresses class imbalance)')
+                        help='Apply Thalia-identical spatial augmentation to all training samples')
     parser.add_argument('--channels', default='all', choices=['all', 'core'],
                         help="'all' = 9 channels/timestep (27 total); "
                              "'core' = insar_difference/insar_coherence/dem only "
@@ -315,9 +315,9 @@ if __name__ == "__main__":
 
     Path("outputs").mkdir(exist_ok=True)
 
-    shuffle_tag      = "_shuffled" if args.shuffle else ""
-    aug_tag          = "_aug" if args.augment else ""
-    channels_tag     = "_core" if args.channels == 'core' else ""
+    shuffle_tag  = "_shuffled" if args.shuffle else ""
+    aug_tag      = "_aug"      if args.augment else ""
+    channels_tag = "_core"     if args.channels == 'core' else ""
     run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     if args.shuffle:
         print("ABLATION MODE: frames are shuffled (temporal order destroyed)")
     if args.augment:
-        print("AUGMENT MODE: spatial augmentation applied to train_pos only")
+        print("AUGMENT MODE: Thalia-identical spatial augmentation on all training samples")
     if args.channels == 'core':
         print("CHANNEL ABLATION: core channels only (insar_difference, insar_coherence, dem)")
     print("=" * 70)
@@ -348,7 +348,7 @@ if __name__ == "__main__":
         data_root=args.data_root,
         stats_path=args.stats_path,
         shuffle_frames=args.shuffle,
-        augment_pos=args.augment,
+        augment=args.augment,
         channels=args.channels,
     )
 
@@ -367,7 +367,7 @@ if __name__ == "__main__":
     print(f"  train total: ~{(n_pos + n_neg) * max_shard} samples "
           f"(RandomMix balances to ~{min(n_pos, n_neg) * max_shard * 2} per epoch)\n")
 
-    # Create model
+    # Create model — input channels depend on --channels flag
     print(f"\nCreating {CFG['model_name']} model...")
     n_ch_per_frame = CFG['n_channels_per_timestep']  # 9 ('all') or 3 ('core')
     if CFG['model_name'] == 'baseline':
@@ -476,7 +476,7 @@ if __name__ == "__main__":
         if epoch % args.checkpoint_every == 0:
             save_checkpoint(
                 resume_ckpt_path, model, optimizer, scheduler, epoch, best_f1, history,
-                args.channels
+                args.channels,
             )
 
     total_elapsed = time.time() - train_start
