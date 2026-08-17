@@ -142,6 +142,123 @@ class CNNLSTMClassifier(nn.Module):
         return self.head(last)
 
 
+class ConvLSTMCell(nn.Module):
+    """Single ConvLSTM cell (Shi et al., 2015).
+
+    Same gating as a standard LSTM, but every gate is a convolution over a
+    spatial feature map instead of a matmul over a flat vector — so hidden/cell
+    state stay [C, H, W] tensors and 'where' information survives the
+    recurrence. All 4 gates are produced by one conv (input and previous
+    hidden state concatenated on the channel dim), the standard efficient
+    formulation.
+    """
+    def __init__(self, in_channels, hidden_channels, kernel_size=3):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.gates = nn.Conv2d(
+            in_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+        )
+
+    def forward(self, x, state):
+        h_prev, c_prev = state
+        combined = torch.cat([x, h_prev], dim=1)
+        i, f, o, g = self.gates(combined).chunk(4, dim=1)
+        i, f, o = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c_prev + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+    def init_state(self, batch_size, height, width, device):
+        shape = (batch_size, self.hidden_channels, height, width)
+        return (torch.zeros(shape, device=device), torch.zeros(shape, device=device))
+
+
+class ConvLSTMClassifier(nn.Module):
+    """Thesis contribution #2: a *true* ConvLSTM (Shi et al., 2015) with a
+    ResNet-50 encoder — Thalia's paper reports benchmark numbers for exactly
+    this kind of model (best time-series classification result in their
+    Table 3: F1=78.89%, AUROC=96.19%) but never published its architecture.
+
+    Differs from CNNLSTMClassifier: the encoder is NOT global-average-pooled
+    per frame before the recurrence. Instead it keeps spatial feature maps
+    alive through the ConvLSTM, so the model can track *where* deformation
+    is and how that location evolves across timesteps, not just *how much*
+    of each feature fired.
+    """
+    def __init__(
+        self,
+        backbone='resnet50',
+        in_channels_per_frame=9,
+        timeseries_len=3,
+        bottleneck_channels=256,
+        hidden_channels=128,
+        kernel_size=3,
+        num_classes=2,
+        dropout=0.3,
+        pretrained=True,
+    ):
+        super().__init__()
+        self.T = timeseries_len
+        self.C = in_channels_per_frame
+
+        # features_only=True: keep the last conv stage's spatial feature map
+        # instead of pooling it away (e.g. [2048, 16, 16] for 512x512 input).
+        self.cnn = timm.create_model(
+            backbone,
+            pretrained=pretrained,
+            in_chans=in_channels_per_frame,
+            features_only=True,
+            out_indices=(4,),
+        )
+        cnn_out_channels = self.cnn.feature_info.channels()[-1]  # 2048 for ResNet50
+
+        # 1x1 conv to shrink channel count before the ConvLSTM gates — keeps
+        # gate-conv params in the same ballpark as CNNLSTMClassifier's LSTM.
+        # Dropout2d here regularizes the encoder->recurrence interface: all 3
+        # ConvLSTM runs so far show severe overfitting (train loss -> 0.0000
+        # while val loss keeps climbing), so this needed real regularization,
+        # not just a different loss/weight_decay recipe.
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(cnn_out_channels, bottleneck_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+        self.conv_lstm = ConvLSTMCell(bottleneck_channels, hidden_channels, kernel_size)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_channels),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, 128),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        # x: (B, T*C, H, W)
+        B, TC, H, W = x.shape
+        T, C = self.T, self.C
+        assert TC == T * C
+
+        x = x.view(B, T, C, H, W)
+        x_flat = x.view(B * T, C, H, W)
+        feats = self.cnn(x_flat)[-1]            # (B*T, cnn_out, H', W')
+        feats = self.bottleneck(feats)          # (B*T, bottleneck, H', W')
+        _, Cb, Hf, Wf = feats.shape
+        feats = feats.view(B, T, Cb, Hf, Wf)
+
+        h, c = self.conv_lstm.init_state(B, Hf, Wf, feats.device)
+        for t in range(T):
+            h, c = self.conv_lstm(feats[:, t], (h, c))
+
+        pooled = h.mean(dim=(2, 3))  # global average pool final hidden state -> (B, hidden_channels)
+        return self.head(pooled)
+
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
@@ -291,7 +408,7 @@ def load_checkpoint(path, model, optimizer, scheduler, channels):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',    default='cnn_lstm', choices=['baseline', 'cnn_lstm'])
+    parser.add_argument('--model',    default='cnn_lstm', choices=['baseline', 'cnn_lstm', 'convlstm'])
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
     parser.add_argument('--shuffle',  action='store_true', help='Shuffle frames (ablation)')
     parser.add_argument('--augment',  action='store_true',
@@ -300,6 +417,17 @@ if __name__ == "__main__":
                         help="'all' = 9 channels/timestep (27 total); "
                              "'core' = insar_difference/insar_coherence/dem only "
                              "(9 total) — ablation dropping the 6 atmospheric channels")
+    parser.add_argument('--loss', default='focal', choices=['focal', 'ce'],
+                        help="'focal' (default) = FocalLoss(gamma=2), our established recipe "
+                             "(all prior results use this). 'ce' = CrossEntropyLoss, matching "
+                             "Thalia paper's Suppl. B Training Setup text — the recipe that "
+                             "actually produced their published benchmark numbers (the checked-in "
+                             "configs.json default of FocalLoss/wd=1e-4 does not match that text).")
+    parser.add_argument('--weight_decay', type=float, default=CFG['weight_decay'],
+                        help=f"AdamW weight decay (default {CFG['weight_decay']:g}, our recipe). "
+                             "Thalia's Suppl. B reports 1e-2 for their published numbers — pass "
+                             "--weight_decay 1e-2 together with --loss ce to match their recipe "
+                             "exactly for a head-to-head comparison.")
     parser.add_argument('--data_root',  default=DEFAULT_DATA_ROOT)
     parser.add_argument('--stats_path', default=DEFAULT_STATS_PATH)
     parser.add_argument('--resume',   action='store_true',
@@ -318,10 +446,15 @@ if __name__ == "__main__":
     shuffle_tag  = "_shuffled" if args.shuffle else ""
     aug_tag      = "_aug"      if args.augment else ""
     channels_tag = "_core"     if args.channels == 'core' else ""
-    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
+    loss_tag     = "_ce"       if args.loss == 'ce' else ""
+    # Compare against the original default (before CFG['weight_decay'] is overwritten below)
+    wd_tag       = "" if args.weight_decay == CFG['weight_decay'] else f"_wd{args.weight_decay:g}"
+    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}{loss_tag}{wd_tag}"
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
+
+    CFG['weight_decay'] = args.weight_decay
 
     print("\n" + "=" * 70)
     print(f"Training: {run_name.upper()}  |  epochs={CFG['epochs']}")
@@ -331,6 +464,8 @@ if __name__ == "__main__":
         print("AUGMENT MODE: Thalia-identical spatial augmentation on all training samples")
     if args.channels == 'core':
         print("CHANNEL ABLATION: core channels only (insar_difference, insar_coherence, dem)")
+    print(f"Recipe: loss={args.loss}  weight_decay={args.weight_decay:g}"
+          + ("  (matches Thalia Suppl. B)" if (args.loss == 'ce' and args.weight_decay == 1e-2) else ""))
     print("=" * 70)
 
     # Verify paths before anything expensive
@@ -383,6 +518,15 @@ if __name__ == "__main__":
             lstm_hidden=256,
             num_classes=CFG['num_classes'],
         )
+    elif CFG['model_name'] == 'convlstm':
+        model = ConvLSTMClassifier(
+            backbone='resnet50',
+            in_channels_per_frame=n_ch_per_frame,
+            timeseries_len=CFG['timeseries_length'],
+            bottleneck_channels=256,
+            hidden_channels=128,
+            num_classes=CFG['num_classes'],
+        )
     else:
         raise ValueError(f"Unknown model: {CFG['model_name']}")
 
@@ -395,9 +539,15 @@ if __name__ == "__main__":
         model = nn.DataParallel(model)
 
     # Optimizer, scheduler, loss
-    # FocalLoss matches Thalia's config (loss_criterion: FocalLoss, gamma=2).
-    # CrossEntropyLoss with imbalanced data caused model to predict all-negative → F1=0%.
-    criterion = FocalLoss(gamma=2)
+    # --loss selects the recipe:
+    #   'focal' (default) — FocalLoss(gamma=2). CrossEntropyLoss with imbalanced
+    #                        data and no undersampling caused the model to predict
+    #                        all-negative -> F1=0%; this is our established recipe.
+    #   'ce'               — CrossEntropyLoss, matching Thalia's Suppl. B "Training
+    #                        Setup" text, which is what actually produced their
+    #                        published numbers (undersampling via RandomMix still
+    #                        applies, so all-negative collapse isn't a risk here).
+    criterion = nn.CrossEntropyLoss() if args.loss == 'ce' else FocalLoss(gamma=2)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=CFG['lr'],
@@ -466,7 +616,16 @@ if __name__ == "__main__":
 
         # Save metrics log every epoch for live monitoring
         with open(metrics_log_path, 'w') as f:
-            json.dump({'run_name': run_name, 'history': history}, f, indent=2)
+            json.dump({
+                'run_name':       run_name,
+                'model':          args.model,
+                'channels':       args.channels,
+                'loss':           args.loss,
+                'weight_decay':   args.weight_decay,
+                'shuffle_frames': args.shuffle,
+                'augment':        args.augment,
+                'history':        history,
+            }, f, indent=2)
 
         if val_metrics['f1'] > best_f1:
             best_f1 = val_metrics['f1']
