@@ -52,7 +52,8 @@ CFG = {
     'epochs': 3,           # 3 for sanity check, 90 for full training (overridden by --epochs)
     'batch_size': 8,
     'lr': 1e-5,
-    'weight_decay': 1e-4,   # matches Thalia configs.json (was 1e-2 — 100x too high)
+    'weight_decay': 1e-4,   # our established recipe; override with --weight_decay 1e-2 to
+                             # match Thalia's Suppl. B "Training Setup" text (--loss ce too)
     'gradient_clip': 1.0,
     'timeseries_length': 3,
     'n_channels_per_timestep': 9,  # 3 geo + 6 atm; set to 3 when --channels=core
@@ -367,6 +368,15 @@ def _model_state(model):
     return model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
 
 
+def _load_into_model(model, state_dict):
+    """Load a state dict saved via _model_state() (no 'module.' prefix) into
+    model, transparently handling DataParallel wrapping. Without this, loading
+    on a multi-GPU run raises a key-mismatch error (state dict has no
+    'module.' prefix, but a DataParallel-wrapped model expects one)."""
+    target = model.module if isinstance(model, nn.DataParallel) else model
+    target.load_state_dict(state_dict)
+
+
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history, channels):
     """Save full training state for exact resume."""
     torch.save({
@@ -390,7 +400,7 @@ def load_checkpoint(path, model, optimizer, scheduler, channels):
             f"but this run is using channels='{channels}'. Refusing to load a "
             "checkpoint with a mismatched channel count / input shape."
         )
-    model.load_state_dict(ckpt['model_state_dict'])
+    _load_into_model(model, ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     if 'scheduler_state_dict' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
@@ -410,6 +420,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',    default='cnn_lstm', choices=['baseline', 'cnn_lstm', 'convlstm'])
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
+    parser.add_argument('--patience', type=int, default=0,
+                        help='Early stopping: stop if val F1 has not improved for this many '
+                             'epochs (0 = disabled, always train the full --epochs). The best '
+                             'checkpoint by val F1 is saved throughout regardless — this only '
+                             'controls when training stops, not what gets saved.')
     parser.add_argument('--shuffle',  action='store_true', help='Shuffle frames (ablation)')
     parser.add_argument('--augment',  action='store_true',
                         help='Apply Thalia-identical spatial augmentation to all training samples')
@@ -449,7 +464,8 @@ if __name__ == "__main__":
     loss_tag     = "_ce"       if args.loss == 'ce' else ""
     # Compare against the original default (before CFG['weight_decay'] is overwritten below)
     wd_tag       = "" if args.weight_decay == CFG['weight_decay'] else f"_wd{args.weight_decay:g}"
-    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}{loss_tag}{wd_tag}"
+    patience_tag = f"_es{args.patience}" if args.patience > 0 else ""
+    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}{loss_tag}{wd_tag}{patience_tag}"
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
@@ -466,6 +482,8 @@ if __name__ == "__main__":
         print("CHANNEL ABLATION: core channels only (insar_difference, insar_coherence, dem)")
     print(f"Recipe: loss={args.loss}  weight_decay={args.weight_decay:g}"
           + ("  (matches Thalia Suppl. B)" if (args.loss == 'ce' and args.weight_decay == 1e-2) else ""))
+    if args.patience > 0:
+        print(f"EARLY STOPPING: patience={args.patience} epochs on val F1")
     print("=" * 70)
 
     # Verify paths before anything expensive
@@ -561,8 +579,9 @@ if __name__ == "__main__":
 
     # Resume logic
     start_epoch = 1
-    best_f1     = 0.0
+    best_f1     = -1.0  # -1 guarantees a checkpoint is saved after epoch 1 even if F1=0%
     history     = []
+    epochs_without_improvement = 0  # for --patience; resets on resume (not persisted in checkpoint)
 
     if args.resume:
         if Path(resume_ckpt_path).exists():
@@ -624,13 +643,17 @@ if __name__ == "__main__":
                 'weight_decay':   args.weight_decay,
                 'shuffle_frames': args.shuffle,
                 'augment':        args.augment,
+                'patience':       args.patience,
                 'history':        history,
             }, f, indent=2)
 
         if val_metrics['f1'] > best_f1:
             best_f1 = val_metrics['f1']
+            epochs_without_improvement = 0
             torch.save(_model_state(model), best_ckpt_path)
             print(f"  Best checkpoint saved (F1={best_f1:.1f}%)\n")
+        else:
+            epochs_without_improvement += 1
 
         if epoch % args.checkpoint_every == 0:
             save_checkpoint(
@@ -638,16 +661,22 @@ if __name__ == "__main__":
                 args.channels,
             )
 
+        if args.patience > 0 and epochs_without_improvement >= args.patience:
+            print(f"\nEarly stopping: no val F1 improvement for {args.patience} epochs "
+                  f"(best={best_f1:.1f}% at epoch {epoch - epochs_without_improvement}).")
+            break
+
     total_elapsed = time.time() - train_start
     total_mins, total_secs = divmod(int(total_elapsed), 60)
     print("=" * 70)
     print(f"Training complete! Best val F1: {best_f1:.1f}%")
+    print(f"Epochs trained: {len(history)}" + (f" (early-stopped, target was {CFG['epochs']})" if len(history) < CFG['epochs'] else ""))
     print(f"Total training time: {total_mins}m {total_secs}s")
 
     # ── Final test set evaluation using best checkpoint ──────────────────
     print("\nRunning final test set evaluation (best checkpoint)...")
     best_state = torch.load(best_ckpt_path, map_location=CFG['device'], weights_only=True)
-    model.load_state_dict(best_state)
+    _load_into_model(model, best_state)
     test_metrics = evaluate(model, test_loader, criterion)
 
     print(f"  Test F1        : {test_metrics['f1']:6.2f}%")
