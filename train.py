@@ -316,7 +316,8 @@ def train_epoch(model, loader, optimizer, criterion, epoch):
         loss   = criterion(logits, labels)
         loss.backward()
 
-        nn.utils.clip_grad_norm_(model.parameters(), CFG['gradient_clip'])
+        if CFG['gradient_clip'] > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), CFG['gradient_clip'])
         optimizer.step()
 
         total_loss += loss.item()
@@ -443,6 +444,21 @@ if __name__ == "__main__":
                              "Thalia's Suppl. B reports 1e-2 for their published numbers — pass "
                              "--weight_decay 1e-2 together with --loss ce to match their recipe "
                              "exactly for a head-to-head comparison.")
+    parser.add_argument('--batch_size', type=int, default=CFG['batch_size'],
+                        help=f"Samples per batch (default {CFG['batch_size']}).")
+    parser.add_argument('--gradient_clip', type=float, default=CFG['gradient_clip'],
+                        help=f"Max gradient norm (default {CFG['gradient_clip']:g}). "
+                             "Pass 0 (or negative) to disable clipping entirely — Thalia's "
+                             "own configs.json default is null (no clipping); we've always "
+                             "clipped at 1.0, which was never a documented match to their recipe.")
+    parser.add_argument('--lr_schedule', default='cosine', choices=['cosine', 'none'],
+                        help="'cosine' (default) = CosineAnnealingLR to eta_min=1e-7 over "
+                             "--epochs. NOTE: with --patience, training usually stops well "
+                             "before --epochs is reached, so the schedule never gets near its "
+                             "floor — LR stays high relative to what the curve was tuned for. "
+                             "'none' = fixed LR the whole run, matching Thalia's Suppl. B text "
+                             "verbatim ('a fixed learning rate of 10^-5'); also sidesteps the "
+                             "early-stopping/schedule mismatch above.")
     parser.add_argument('--data_root',  default=DEFAULT_DATA_ROOT)
     parser.add_argument('--stats_path', default=DEFAULT_STATS_PATH)
     parser.add_argument('--resume',   action='store_true',
@@ -462,15 +478,21 @@ if __name__ == "__main__":
     aug_tag      = "_aug"      if args.augment else ""
     channels_tag = "_core"     if args.channels == 'core' else ""
     loss_tag     = "_ce"       if args.loss == 'ce' else ""
-    # Compare against the original default (before CFG['weight_decay'] is overwritten below)
+    # Compare against the originals (before CFG is overwritten below)
     wd_tag       = "" if args.weight_decay == CFG['weight_decay'] else f"_wd{args.weight_decay:g}"
     patience_tag = f"_es{args.patience}" if args.patience > 0 else ""
-    run_name         = f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}{loss_tag}{wd_tag}{patience_tag}"
+    bs_tag       = "" if args.batch_size == CFG['batch_size'] else f"_bs{args.batch_size}"
+    gc_tag       = "" if args.gradient_clip == CFG['gradient_clip'] else f"_gc{args.gradient_clip:g}"
+    sched_tag    = "" if args.lr_schedule == 'cosine' else f"_{args.lr_schedule}lr"
+    run_name         = (f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
+                        f"{loss_tag}{wd_tag}{patience_tag}{bs_tag}{gc_tag}{sched_tag}")
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
 
-    CFG['weight_decay'] = args.weight_decay
+    CFG['weight_decay']  = args.weight_decay
+    CFG['batch_size']    = args.batch_size
+    CFG['gradient_clip'] = args.gradient_clip
 
     print("\n" + "=" * 70)
     print(f"Training: {run_name.upper()}  |  epochs={CFG['epochs']}")
@@ -482,6 +504,8 @@ if __name__ == "__main__":
         print("CHANNEL ABLATION: core channels only (insar_difference, insar_coherence, dem)")
     print(f"Recipe: loss={args.loss}  weight_decay={args.weight_decay:g}"
           + ("  (matches Thalia Suppl. B)" if (args.loss == 'ce' and args.weight_decay == 1e-2) else ""))
+    print(f"        batch_size={args.batch_size}  gradient_clip={args.gradient_clip:g}"
+          f"  lr_schedule={args.lr_schedule}")
     if args.patience > 0:
         print(f"EARLY STOPPING: patience={args.patience} epochs on val F1")
     print("=" * 70)
@@ -571,11 +595,19 @@ if __name__ == "__main__":
         lr=CFG['lr'],
         weight_decay=CFG['weight_decay']
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=CFG['epochs'],
-        eta_min=1e-7,
-    )
+    if args.lr_schedule == 'none':
+        # Fixed LR the whole run (matches Thalia's Suppl. B text verbatim, and
+        # sidesteps the cosine/early-stopping mismatch — see --lr_schedule help).
+        # LambdaLR with a constant multiplier keeps .step()/.get_last_lr()/
+        # .state_dict() all working exactly like CosineAnnealingLR, so nothing
+        # else in the checkpoint/resume code needs to change.
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=CFG['epochs'],
+            eta_min=1e-7,
+        )
 
     # Resume logic
     start_epoch = 1
