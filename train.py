@@ -264,7 +264,8 @@ class ConvLSTMClassifier(nn.Module):
 # DATA LOADING
 # ============================================================================
 
-def create_loaders(data_root, stats_path, shuffle_frames=False, augment=False, channels='all'):
+def create_loaders(data_root, stats_path, shuffle_frames=False, augment=False,
+                   channels='all', seed=42):
     from data_loader_fixed import create_loaders as _create_loaders
     return _create_loaders(
         data_root=data_root,
@@ -272,7 +273,7 @@ def create_loaders(data_root, stats_path, shuffle_frames=False, augment=False, c
         timeseries_length=3,
         batch_size=CFG['batch_size'],
         num_workers=4,  # start at 4; increase if stable, drop to 0 if hangs
-        seed=42,
+        seed=seed,
         shuffle_frames=shuffle_frames,
         augment=augment,
         channels=channels,
@@ -444,6 +445,12 @@ if __name__ == "__main__":
                              "Thalia's Suppl. B reports 1e-2 for their published numbers — pass "
                              "--weight_decay 1e-2 together with --loss ce to match their recipe "
                              "exactly for a head-to-head comparison.")
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed (default 42 — every result so far used this). '
+                             'Seeds torch/numpy/random before the loaders AND before model '
+                             'creation, so both the data order and the randomly-initialized '
+                             'layers (bottleneck, ConvLSTM gates, head) vary with it. Use '
+                             '2-3 different seeds to report mean+/-std, as the Thalia paper does.')
     parser.add_argument('--batch_size', type=int, default=CFG['batch_size'],
                         help=f"Samples per batch (default {CFG['batch_size']}).")
     parser.add_argument('--gradient_clip', type=float, default=CFG['gradient_clip'],
@@ -484,8 +491,9 @@ if __name__ == "__main__":
     bs_tag       = "" if args.batch_size == CFG['batch_size'] else f"_bs{args.batch_size}"
     gc_tag       = "" if args.gradient_clip == CFG['gradient_clip'] else f"_gc{args.gradient_clip:g}"
     sched_tag    = "" if args.lr_schedule == 'cosine' else f"_{args.lr_schedule}lr"
+    seed_tag     = "" if args.seed == 42 else f"_seed{args.seed}"
     run_name         = (f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
-                        f"{loss_tag}{wd_tag}{patience_tag}{bs_tag}{gc_tag}{sched_tag}")
+                        f"{loss_tag}{wd_tag}{patience_tag}{bs_tag}{gc_tag}{sched_tag}{seed_tag}")
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
     metrics_log_path = f"outputs/metrics_{run_name}.json"
@@ -505,7 +513,7 @@ if __name__ == "__main__":
     print(f"Recipe: loss={args.loss}  weight_decay={args.weight_decay:g}"
           + ("  (matches Thalia Suppl. B)" if (args.loss == 'ce' and args.weight_decay == 1e-2) else ""))
     print(f"        batch_size={args.batch_size}  gradient_clip={args.gradient_clip:g}"
-          f"  lr_schedule={args.lr_schedule}")
+          f"  lr_schedule={args.lr_schedule}  seed={args.seed}")
     if args.patience > 0:
         print(f"EARLY STOPPING: patience={args.patience} epochs on val F1")
     print("=" * 70)
@@ -527,6 +535,7 @@ if __name__ == "__main__":
         shuffle_frames=args.shuffle,
         augment=args.augment,
         channels=args.channels,
+        seed=args.seed,
     )
 
     # Print shard/sample counts so we know what data is being loaded
@@ -676,6 +685,10 @@ if __name__ == "__main__":
                 'shuffle_frames': args.shuffle,
                 'augment':        args.augment,
                 'patience':       args.patience,
+                'seed':           args.seed,
+                'batch_size':     args.batch_size,
+                'gradient_clip':  args.gradient_clip,
+                'lr_schedule':    args.lr_schedule,
                 'history':        history,
             }, f, indent=2)
 
