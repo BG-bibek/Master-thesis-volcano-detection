@@ -120,7 +120,7 @@ def _make_augment_fn():
 
 
 def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False,
-                  augment_fn=None, channels="all"):
+                  augment_fn=None, channels="all", load_masks=False):
     """
     Decode one raw WebDataset dict into (image, label, meta).
 
@@ -131,6 +131,14 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False,
                         "core" keeps only [insar_difference, insar_coherence, dem]
                         per timestep (9 total) — ablation testing whether the
                         6 atmospheric channels matter.
+        load_masks    : if True, also load labels.pth (the [T, H, W] pixel-level
+                        deformation mask) and attach it to the returned meta dict
+                        under 'deformation_mask' (per-timestep) and
+                        'deformation_mask_union' (any() over timesteps, matching
+                        the union labelling used for classification).
+                        Off by default — classification never needs it, and it is
+                        ~6 MB per sample. Used by gradcam.py to score saliency
+                        maps against ground truth.
 
     Returns None on error so the pipeline can skip bad samples.
     """
@@ -150,6 +158,7 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False,
             image = augment_fn(image)
 
         # Ablation: shuffle timestep order to destroy temporal information
+        perm = None
         if shuffle_frames:
             perm   = torch.randperm(timeseries_length)
             chunks = image.reshape(timeseries_length, N_CHANNELS_PER_TIMESTEP, *image.shape[1:])
@@ -157,6 +166,25 @@ def decode_sample(raw, stats, timeseries_length=3, shuffle_frames=False,
 
         if channels == "core":
             image = image[_core_flat_idx(timeseries_length)]
+
+        # Optional ground-truth deformation mask, carried inside meta so the
+        # (image, label, meta) tuple shape — and therefore _collate and every
+        # existing caller — stays unchanged.
+        if load_masks:
+            raw_mask = raw.get("labels.pth")
+            if raw_mask is not None:
+                mask = torch.load(io.BytesIO(raw_mask), weights_only=False)
+                mask = (mask > 0)
+                # Keep the per-timestep mask aligned with the (possibly permuted)
+                # image frames. The union is permutation-invariant either way.
+                if perm is not None and mask.dim() == 3:
+                    mask = mask[perm]
+                meta["deformation_mask"] = mask
+                # union over timesteps, matching the any() classification label
+                meta["deformation_mask_union"] = mask.any(dim=0) if mask.dim() == 3 else mask
+            else:
+                meta["deformation_mask"] = None
+                meta["deformation_mask_union"] = None
 
         return image, torch.tensor(binary_label, dtype=torch.long), meta
 
@@ -204,6 +232,7 @@ def create_loaders(
     shuffle_frames=False,
     augment=False,
     channels="all",
+    load_masks=False,
 ):
     """
     Build train / val / test DataLoaders.
@@ -219,12 +248,30 @@ def create_loaders(
         seed              : random seed
         augment           : if True, apply Thalia-identical spatial augmentation
                             to all training samples (pos + neg)
+        load_masks        : if True, attach the ground-truth deformation mask
+                            from labels.pth into each sample's meta dict
+                            (see decode_sample). Off by default.
         channels          : "all" (9 ch/timestep, 27 total) or "core"
                             (3 ch/timestep, 9 total — drops atmospheric channels)
 
     Returns:
         train_loader, val_loader, test_loader
     """
+    # Augmentation applies spatial transforms (flips/rotations/crops) to the
+    # image only — the mask is not passed through albumentations, so the two
+    # would be silently misaligned and any localisation score computed from
+    # them would be meaningless. Fail loudly rather than return plausible
+    # garbage. (Only the TRAIN loader augments; val/test never do, so this
+    # only ever blocks a genuinely broken combination.)
+    if load_masks and augment:
+        raise ValueError(
+            "load_masks=True with augment=True would misalign the image and its "
+            "mask: augmentation transforms the image but not the mask. Masks are "
+            "for interpretability analysis on unaugmented val/test data — call "
+            "with augment=False. (Supporting this properly would mean passing the "
+            "mask through albumentations' mask= target in _make_augment_fn.)"
+        )
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -243,7 +290,7 @@ def create_loaders(
     def decode_train(raw):
         return decode_sample(raw, stats, timeseries_length,
                              shuffle_frames=shuffle_frames, augment_fn=aug_fn,
-                             channels=channels)
+                             channels=channels, load_masks=load_masks)
 
     pos_ds = (
         wds.WebDataset(pos_shards, shardshuffle=100)
@@ -267,7 +314,7 @@ def create_loaders(
     def decode_eval(raw):
         return decode_sample(raw, stats, timeseries_length,
                              shuffle_frames=False, augment_fn=None,
-                             channels=channels)
+                             channels=channels, load_masks=load_masks)
 
     def make_eval_loader(split):
         shards = sorted(glob(str(data_root / split / "*.tar")))
