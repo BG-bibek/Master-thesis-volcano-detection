@@ -169,8 +169,9 @@ def resolve_target_layer(model, model_name):
                temporal evolution of spatial attention (the interesting case).
     others   : the encoder's last conv stage, the standard Grad-CAM target.
     """
-    if model_name == 'convlstm':
-        return model.conv_lstm, 'conv_lstm (per-timestep hidden state)'
+    if model_name in ('convlstm', 'convgru'):
+        kind = 'ConvGRU' if model_name == 'convgru' else 'ConvLSTM'
+        return model.conv_lstm, f'{kind} cell (per-timestep hidden state)'
     if model_name == 'cnn_lstm':
         return model.cnn.layer4, 'cnn.layer4 (per-frame encoder features)'
     if model_name == 'baseline':
@@ -260,7 +261,8 @@ def spatial_entropy(cam):
 # indirectly through the recurrence, so their gradients are attenuated and
 # their maps are correspondingly noisy. The other two models feed every frame's
 # features to the classifier, so the mean is the honest aggregate there.
-PRIMARY_AGG = {'convlstm': 'last', 'cnn_lstm': 'mean', 'baseline': 'mean'}
+PRIMARY_AGG = {'convlstm': 'last', 'convgru': 'last',
+               'cnn_lstm': 'mean', 'baseline': 'mean'}
 
 
 def aggregate_cams(cams, how):
@@ -286,12 +288,13 @@ def build_model(model_name, n_ch_per_frame, timeseries_length, num_classes=2):
                                  in_channels_per_frame=n_ch_per_frame,
                                  timeseries_len=timeseries_length,
                                  lstm_hidden=256, num_classes=num_classes)
-    if model_name == 'convlstm':
+    if model_name in ('convlstm', 'convgru'):
         return ConvLSTMClassifier(backbone='resnet50',
                                   in_channels_per_frame=n_ch_per_frame,
                                   timeseries_len=timeseries_length,
                                   bottleneck_channels=256, hidden_channels=128,
-                                  num_classes=num_classes)
+                                  num_classes=num_classes,
+                                  cell='gru' if model_name == 'convgru' else 'lstm')
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -331,7 +334,8 @@ def save_figure(image, cams, mask, meta, prob, path, n_ch_per_frame):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--model', required=True, choices=['baseline', 'cnn_lstm', 'convlstm'])
+    ap.add_argument('--model', required=True,
+                    choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru'])
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--channels', default='all', choices=['all', 'core'],
                     help='Must match what the checkpoint was trained with')

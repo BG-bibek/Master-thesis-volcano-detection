@@ -178,6 +178,47 @@ class ConvLSTMCell(nn.Module):
         return (torch.zeros(shape, device=device), torch.zeros(shape, device=device))
 
 
+class ConvGRUCell(nn.Module):
+    """Single ConvGRU cell — the GRU counterpart of ConvLSTMCell above.
+
+    Same idea (gates are convolutions, so the hidden state stays a [C, H, W]
+    spatial map), but GRU gating: a reset and an update gate, no separate cell
+    state. That is 3 gate tensors instead of 4, so ~25% fewer recurrent
+    parameters.
+
+        r_t = sigma(W_r * [x_t, h_{t-1}])                 reset
+        z_t = sigma(W_z * [x_t, h_{t-1}])                 update
+        n_t = tanh (W_n * [x_t, r_t (*) h_{t-1}])         candidate
+        h_t = (1 - z_t) (*) n_t + z_t (*) h_{t-1}
+
+    Two convs rather than one: the candidate needs r_t (*) h_{t-1}, which is
+    only available after the gate conv has run.
+
+    Interface matches ConvLSTMCell exactly — forward() takes and returns a
+    (h, c) tuple — so it drops into ConvLSTMClassifier's loop unchanged. A GRU
+    has no cell state, so the second slot mirrors h and is never read.
+    """
+    def __init__(self, in_channels, hidden_channels, kernel_size=3):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        pad = kernel_size // 2
+        self.gates = nn.Conv2d(in_channels + hidden_channels,
+                               2 * hidden_channels, kernel_size, padding=pad)
+        self.candidate = nn.Conv2d(in_channels + hidden_channels,
+                                   hidden_channels, kernel_size, padding=pad)
+
+    def forward(self, x, state):
+        h_prev = state[0]
+        r, z = torch.sigmoid(self.gates(torch.cat([x, h_prev], dim=1))).chunk(2, dim=1)
+        n = torch.tanh(self.candidate(torch.cat([x, r * h_prev], dim=1)))
+        h = (1 - z) * n + z * h_prev
+        return h, h   # second slot is a placeholder; a GRU has no cell state
+
+    def init_state(self, batch_size, height, width, device):
+        shape = (batch_size, self.hidden_channels, height, width)
+        return (torch.zeros(shape, device=device), torch.zeros(shape, device=device))
+
+
 class ConvLSTMClassifier(nn.Module):
     """Thesis contribution #2: a *true* ConvLSTM (Shi et al., 2015) with a
     ResNet-50 encoder — Thalia's paper reports benchmark numbers for exactly
@@ -189,6 +230,13 @@ class ConvLSTMClassifier(nn.Module):
     alive through the ConvLSTM, so the model can track *where* deformation
     is and how that location evolves across timesteps, not just *how much*
     of each feature fired.
+
+    `cell` selects the recurrent cell: 'lstm' (default, unchanged — every
+    existing checkpoint was trained with this) or 'gru'. Everything else —
+    encoder, bottleneck, dropout, head — is identical between the two, so the
+    comparison isolates the gating mechanism alone. The submodule keeps the
+    attribute name `conv_lstm` in both cases so existing checkpoints load and
+    gradcam.py needs no change; only the cell inside it differs.
     """
     def __init__(
         self,
@@ -201,6 +249,7 @@ class ConvLSTMClassifier(nn.Module):
         num_classes=2,
         dropout=0.3,
         pretrained=True,
+        cell='lstm',
     ):
         super().__init__()
         self.T = timeseries_len
@@ -228,7 +277,11 @@ class ConvLSTMClassifier(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout),
         )
-        self.conv_lstm = ConvLSTMCell(bottleneck_channels, hidden_channels, kernel_size)
+        if cell not in ('lstm', 'gru'):
+            raise ValueError(f"cell must be 'lstm' or 'gru', got {cell!r}")
+        self.cell_type = cell
+        cell_cls = ConvLSTMCell if cell == 'lstm' else ConvGRUCell
+        self.conv_lstm = cell_cls(bottleneck_channels, hidden_channels, kernel_size)
 
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_channels),
@@ -420,7 +473,12 @@ def load_checkpoint(path, model, optimizer, scheduler, channels):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model',    default='cnn_lstm', choices=['baseline', 'cnn_lstm', 'convlstm'])
+    parser.add_argument('--model',    default='cnn_lstm',
+                        choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru'],
+                        help="'convgru' is 'convlstm' with the ConvLSTM cell swapped for a "
+                             "ConvGRU cell (~25%% fewer recurrent params). Everything else — "
+                             "encoder, bottleneck, dropout, head — is identical, so the "
+                             "comparison isolates the gating mechanism.")
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
     parser.add_argument('--patience', type=int, default=0,
                         help='Early stopping: stop if val F1 has not improved for this many '
@@ -569,7 +627,7 @@ if __name__ == "__main__":
             lstm_hidden=256,
             num_classes=CFG['num_classes'],
         )
-    elif CFG['model_name'] == 'convlstm':
+    elif CFG['model_name'] in ('convlstm', 'convgru'):
         model = ConvLSTMClassifier(
             backbone='resnet50',
             in_channels_per_frame=n_ch_per_frame,
@@ -577,6 +635,7 @@ if __name__ == "__main__":
             bottleneck_channels=256,
             hidden_channels=128,
             num_classes=CFG['num_classes'],
+            cell='gru' if CFG['model_name'] == 'convgru' else 'lstm',
         )
     else:
         raise ValueError(f"Unknown model: {CFG['model_name']}")

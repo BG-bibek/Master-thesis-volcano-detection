@@ -26,7 +26,7 @@ import json
 import statistics as st
 from pathlib import Path
 
-MODELS = ['baseline', 'cnn_lstm', 'convlstm']
+MODELS = ['baseline', 'cnn_lstm', 'convlstm', 'convgru']
 
 # ── PRE-REGISTERED DECISION RULE ─────────────────────────────────────────
 # Fixed BEFORE running the dilation scan, from the already-observed r=0

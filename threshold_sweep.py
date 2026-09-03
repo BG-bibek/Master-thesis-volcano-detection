@@ -54,11 +54,12 @@ def build_model(model_name, n_ch_per_frame, timeseries_length, num_classes=2):
             backbone='resnet50', in_channels_per_frame=n_ch_per_frame,
             timeseries_len=timeseries_length, lstm_hidden=256, num_classes=num_classes,
         )
-    elif model_name == 'convlstm':
+    elif model_name in ('convlstm', 'convgru'):
         return ConvLSTMClassifier(
             backbone='resnet50', in_channels_per_frame=n_ch_per_frame,
             timeseries_len=timeseries_length, bottleneck_channels=256,
             hidden_channels=128, num_classes=num_classes,
+            cell='gru' if model_name == 'convgru' else 'lstm',
         )
     raise ValueError(f"Unknown model: {model_name}")
 
@@ -112,7 +113,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('--model', required=True, choices=['baseline', 'cnn_lstm', 'convlstm'])
+    parser.add_argument('--model', required=True, choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru'])
     parser.add_argument('--checkpoint', required=True,
                         help='Path to a best_*.pth checkpoint (raw state dict, as saved by train.py)')
     parser.add_argument('--channels', default='all', choices=['all', 'core'],
