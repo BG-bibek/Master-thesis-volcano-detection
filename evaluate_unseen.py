@@ -78,6 +78,8 @@ def infer_model_name(state_dict):
     the LSTM cell emits 4 gate groups from one conv, the GRU 2.
     """
     keys = set(state_dict.keys())
+    if any(k.startswith('temporal_proj.') for k in keys):
+        return 'latefusion'          # Arm C: no recurrent cell at all
     if any(k.startswith('conv_lstm.') for k in keys):
         # The GRU cell has a separate candidate conv; the LSTM cell does not.
         # Cross-checked against gate width: LSTM emits 4 groups, GRU 2.
@@ -97,6 +99,19 @@ def infer_model_name(state_dict):
     if any(k.startswith('model.') for k in keys):
         return 'baseline'
     raise ValueError("could not identify architecture from checkpoint keys")
+
+
+def load_arch_meta(ckpt_path):
+    """Read the sidecar written by train.save_arch_meta, if one exists.
+
+    Authoritative when present. Its absence is not an error: every checkpoint
+    predating it was trained with aggregate='last'.
+    """
+    side = Path(str(ckpt_path) + '.meta.json')
+    if side.exists():
+        with open(side) as f:
+            return json.load(f)
+    return None
 
 
 def unwrap_checkpoint(ckpt):
@@ -138,13 +153,15 @@ def build_model(model_name, n_ch_per_frame, timeseries_length, num_classes=2):
                                  in_channels_per_frame=n_ch_per_frame,
                                  timeseries_len=timeseries_length,
                                  lstm_hidden=256, num_classes=num_classes)
-    if model_name in ('convlstm', 'convgru'):
+    if model_name in ('convlstm', 'convgru', 'convlstm_max', 'latefusion'):
+        cell = {'convgru': 'gru', 'latefusion': 'none'}.get(model_name, 'lstm')
+        aggregate = 'max' if model_name in ('convlstm_max', 'latefusion') else 'last'
         return ConvLSTMClassifier(backbone='resnet50',
                                   in_channels_per_frame=n_ch_per_frame,
                                   timeseries_len=timeseries_length,
                                   bottleneck_channels=256, hidden_channels=128,
                                   num_classes=num_classes,
-                                  cell='gru' if model_name == 'convgru' else 'lstm')
+                                  cell=cell, aggregate=aggregate)
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -273,7 +290,8 @@ def main():
                     help="statistics.json the model was TRAINED with. Do not "
                          "recompute this on the unseen data.")
     ap.add_argument('--model', default='auto',
-                    choices=['auto', 'baseline', 'cnn_lstm', 'convlstm', 'convgru'])
+                    choices=['auto', 'baseline', 'cnn_lstm', 'convlstm', 'convgru',
+                             'convlstm_max', 'latefusion'])
     ap.add_argument('--timeseries_length', type=int, default=3)
     ap.add_argument('--batch_size', type=int, default=8)
     ap.add_argument('--num_workers', type=int, default=0)
@@ -290,7 +308,18 @@ def main():
     device = get_device()
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     state, wrapper = unwrap_checkpoint(ckpt)
+    meta = load_arch_meta(args.checkpoint)
     model_name = infer_model_name(state) if args.model == 'auto' else args.model
+    # Arms A and B are indistinguishable from weights alone; resolve via sidecar,
+    # then filename, then the pre-existing default.
+    if args.model == 'auto' and model_name in ('convlstm', 'convgru'):
+        if meta and meta.get('aggregate') == 'max':
+            model_name = 'convlstm_max'
+            print("architecture  : max-logit aggregation (from checkpoint sidecar)")
+        elif 'maxlogit' in Path(args.checkpoint).name:
+            model_name = 'convlstm_max'
+            print("architecture  : max-logit aggregation inferred from FILENAME - "
+                  "no sidecar found. Verify this is correct.")
     channels = infer_channels(state, model_name, args.timeseries_length)
     if wrapper.get('channels') and wrapper['channels'] != channels:
         raise SystemExit(

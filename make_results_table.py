@@ -51,8 +51,9 @@ PAPER_SINGLE = [
     ("ViT",            "yes", "90.75 ± 1.51", "59.27 ± 7.47", "71.45 ± 5.45", "88.60 ± 3.00"),
 ]
 
-MODEL_ORDER = ['convlstm', 'convgru', 'cnn_lstm', 'baseline']
+MODEL_ORDER = ['convlstm', 'convgru', 'latefusion', 'cnn_lstm', 'baseline']
 MODEL_LABEL = {'convlstm': 'ConvLSTM', 'convgru': 'ConvGRU',
+               'latefusion': 'Late fusion (no recurrence)',
                'cnn_lstm': 'CNN-LSTM', 'baseline': 'Baseline ResNet-50'}
 
 
@@ -68,6 +69,8 @@ def parse_args_line(args):
         'lr_sched':  'fixed' if re.search(r'--lr_schedule\s+none', args) else 'cosine',
         'channels':  (re.search(r'--channels\s+(\S+)', args) or [None, 'all'])[1],
         'seed':      (re.search(r'--seed\s+(\d+)', args) or [None, '42'])[1],
+        'aggregate': ('max' if (re.search(r'--aggregate\s+max', args)
+                                or re.search(r'--model\s+latefusion', args)) else 'last'),
         'epochs_max':(re.search(r'--epochs\s+(\d+)', args) or [None, '90'])[1],
     }
     return c
@@ -76,7 +79,8 @@ def parse_args_line(args):
 def parse_name(run_name):
     """Fallback config recovery when no log exists for a run."""
     n = run_name
-    model = ('convgru' if 'convgru' in n else
+    model = ('latefusion' if 'latefusion' in n else
+             'convgru' if 'convgru' in n else
              'convlstm' if 'convlstm' in n else
              'cnn_lstm' if 'cnn_lstm' in n else
              'baseline' if 'baseline' in n else '?')
@@ -93,6 +97,7 @@ def parse_name(run_name):
         'channels': 'core' if 'core' in n else 'all',
         'seed': seed.group(1) if seed else '42',
         'epochs_max': '90',
+        'aggregate': 'max' if ('maxlogit' in n or 'latefusion' in n) else 'last',
     }
 
 
@@ -147,9 +152,9 @@ def dedupe(rows):
     config (it is the actual command line) and note both files."""
     out, seen = [], {}
     for r in sorted(rows, key=lambda r: 0 if r['kind'] == 'log' else 1):
-        key = (r['model'], r['shuffled'], r['augment'], r['loss'], r['wd'],
-               r['patience'], r['lr_sched'], r['channels'], r['seed'],
-               round(r['f1'], 2))
+        key = (r['model'], r.get('aggregate', 'last'), r['shuffled'], r['augment'],
+               r['loss'], r['wd'], r['patience'], r['lr_sched'], r['channels'],
+               r['seed'], round(r['f1'], 2))
         if key in seen:
             seen[key]['also'] = seen[key].get('also', []) + [r['source']]
             continue
@@ -171,6 +176,8 @@ def cfgstr(r):
         bits.append('**core 3ch**')
     if r['shuffled']:
         bits.append('**shuffled**')
+    if r.get('aggregate') == 'max':
+        bits.append('**max-logit**')
     return ', '.join(bits)
 
 
@@ -339,7 +346,7 @@ def main():
     Path('outputs').mkdir(exist_ok=True)
     cols = ['model', 'f1', 'auroc', 'prec', 'rec', 'epochs', 'best_val_f1', 'seed',
             'augment', 'loss', 'wd', 'patience', 'lr_sched', 'channels', 'shuffled',
-            'source', 'kind']
+            'aggregate', 'source', 'kind']
     with open('outputs/all_results.csv', 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
         wr.writeheader()

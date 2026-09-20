@@ -250,6 +250,7 @@ class ConvLSTMClassifier(nn.Module):
         dropout=0.3,
         pretrained=True,
         cell='lstm',
+        aggregate='last',
     ):
         super().__init__()
         self.T = timeseries_len
@@ -277,11 +278,31 @@ class ConvLSTMClassifier(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(dropout),
         )
-        if cell not in ('lstm', 'gru'):
-            raise ValueError(f"cell must be 'lstm' or 'gru', got {cell!r}")
+        if cell not in ('lstm', 'gru', 'none'):
+            raise ValueError(f"cell must be 'lstm', 'gru' or 'none', got {cell!r}")
+        if aggregate not in ('last', 'max'):
+            raise ValueError(f"aggregate must be 'last' or 'max', got {aggregate!r}")
+        if cell == 'none' and aggregate != 'max':
+            # Without recurrence there is no meaningful "final" state: h_3 would
+            # just be frame 3's projection, so 'last' would silently become a
+            # single-frame model rather than a late-fusion one.
+            raise ValueError("cell='none' requires aggregate='max'")
         self.cell_type = cell
-        cell_cls = ConvLSTMCell if cell == 'lstm' else ConvGRUCell
-        self.conv_lstm = cell_cls(bottleneck_channels, hidden_channels, kernel_size)
+        self.aggregate = aggregate
+        if cell == 'none':
+            # Arm C. Mirrors the ConvLSTM cell's spatial operation - same 3x3
+            # kernel, same hidden width - applied independently per timestep so
+            # nothing mixes across time before the max. Relative to Arm B the
+            # only thing removed is the recurrent edge.
+            self.conv_lstm = None
+            self.temporal_proj = nn.Sequential(
+                nn.Conv2d(bottleneck_channels, hidden_channels, kernel_size,
+                          padding=kernel_size // 2),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            cell_cls = ConvLSTMCell if cell == 'lstm' else ConvGRUCell
+            self.conv_lstm = cell_cls(bottleneck_channels, hidden_channels, kernel_size)
 
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_channels),
@@ -292,7 +313,11 @@ class ConvLSTMClassifier(nn.Module):
             nn.Linear(128, num_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x, return_per_timestep=False):
+        """`return_per_timestep` is an analysis-only escape hatch returning
+        (logits, z, idx) instead of logits. Nothing in the training or
+        evaluation path passes it, so the normal signature and return type
+        are unchanged."""
         # x: (B, T*C, H, W)
         B, TC, H, W = x.shape
         T, C = self.T, self.C
@@ -305,12 +330,38 @@ class ConvLSTMClassifier(nn.Module):
         _, Cb, Hf, Wf = feats.shape
         feats = feats.view(B, T, Cb, Hf, Wf)
 
-        h, c = self.conv_lstm.init_state(B, Hf, Wf, feats.device)
-        for t in range(T):
-            h, c = self.conv_lstm(feats[:, t], (h, c))
+        if self.conv_lstm is None:
+            # Arm C: per-timestep spatial projection, no temporal mixing.
+            g = self.temporal_proj(feats.reshape(B * T, Cb, Hf, Wf))
+            pooled_t = g.mean(dim=(2, 3)).view(B, T, -1)          # (B, T, hidden)
+        else:
+            h, c = self.conv_lstm.init_state(B, Hf, Wf, feats.device)
+            states = []
+            for t in range(T):
+                h, c = self.conv_lstm(feats[:, t], (h, c))
+                states.append(h.mean(dim=(2, 3)))                 # GAP each hidden state
+            pooled_t = torch.stack(states, dim=1)                 # (B, T, hidden)
 
-        pooled = h.mean(dim=(2, 3))  # global average pool final hidden state -> (B, hidden_channels)
-        return self.head(pooled)
+        if self.aggregate == 'last' and not return_per_timestep:
+            # Arm A, byte-for-byte the original behaviour.
+            return self.head(pooled_t[:, -1])
+
+        # One head call over (B*T, hidden). LayerNorm normalises over the last
+        # dim per row, so folding T into the batch is identical to looping, and
+        # the head is shared across timesteps by construction (no new params).
+        z = self.head(pooled_t.reshape(B * T, -1)).view(B, T, -1)  # (B, T, num_classes)
+
+        if self.aggregate == 'last':
+            logits, idx = z[:, -1], None
+        else:
+            # Select the timestep by positive-class margin, then take THAT
+            # timestep's whole logit vector. An elementwise max over dim=1 would
+            # mix class-0 from one timestep with class-1 from another, giving an
+            # incoherent pair that still trains without ever erroring.
+            idx = (z[..., 1] - z[..., 0]).argmax(dim=1)            # (B,)
+            logits = z[torch.arange(B, device=z.device), idx]      # (B, num_classes)
+
+        return (logits, z, idx) if return_per_timestep else logits
 
 
 # ============================================================================
@@ -432,6 +483,27 @@ def _load_into_model(model, state_dict):
     target.load_state_dict(state_dict)
 
 
+def save_arch_meta(ckpt_path, model_name, cell, aggregate, channels, timeseries_length):
+    """Write a sidecar describing the architecture next to a bare state dict.
+
+    Arm A (convlstm/last) and Arm B (convlstm/max) have IDENTICAL parameter
+    names and shapes - the max aggregation adds nothing and reuses the same
+    head - so architecture cannot be recovered from the weights alone. Loading
+    an Arm B checkpoint as Arm A would silently produce wrong predictions
+    rather than an error. The sidecar removes the ambiguity.
+
+    Kept separate from the .pth so best_*.pth stays a plain state dict and the
+    existing weights_only=True load path is unaffected. Checkpoints written
+    before this existed simply have no sidecar, and are correctly treated as
+    aggregate='last'.
+    """
+    import json as _json
+    meta = {'model_name': model_name, 'cell': cell, 'aggregate': aggregate,
+            'channels': channels, 'timeseries_length': timeseries_length}
+    with open(str(ckpt_path) + '.meta.json', 'w') as f:
+        _json.dump(meta, f, indent=2)
+
+
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_f1, history, channels):
     """Save full training state for exact resume."""
     torch.save({
@@ -474,11 +546,20 @@ def load_checkpoint(path, model, optimizer, scheduler, channels):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',    default='cnn_lstm',
-                        choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru'],
+                        choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru',
+                                 'latefusion'],
                         help="'convgru' is 'convlstm' with the ConvLSTM cell swapped for a "
                              "ConvGRU cell (~25%% fewer recurrent params). Everything else — "
                              "encoder, bottleneck, dropout, head — is identical, so the "
                              "comparison isolates the gating mechanism.")
+    parser.add_argument('--aggregate', default='last', choices=['last', 'max'],
+                        help="How the per-timestep hidden states become one "
+                             "prediction. 'last' (default) classifies from the "
+                             "final state only - the original behaviour. 'max' "
+                             "applies the shared head to every timestep and "
+                             "selects the one with the largest positive-class "
+                             "margin, which matches the any() sequence label. "
+                             "Ignored by --model baseline and cnn_lstm.")
     parser.add_argument('--epochs',   type=int, default=CFG['epochs'])
     parser.add_argument('--patience', type=int, default=0,
                         help='Early stopping: stop if val F1 has not improved for this many '
@@ -534,6 +615,7 @@ if __name__ == "__main__":
     print("Args:", args)
 
     CFG['model_name'] = args.model
+    CFG['aggregate']  = args.aggregate
     CFG['epochs']     = args.epochs
     CFG['n_channels_per_timestep'] = 3 if args.channels == 'core' else 9
 
@@ -550,7 +632,11 @@ if __name__ == "__main__":
     gc_tag       = "" if args.gradient_clip == CFG['gradient_clip'] else f"_gc{args.gradient_clip:g}"
     sched_tag    = "" if args.lr_schedule == 'cosine' else f"_{args.lr_schedule}lr"
     seed_tag     = "" if args.seed == 42 else f"_seed{args.seed}"
-    run_name         = (f"{CFG['model_name']}{shuffle_tag}{aug_tag}{channels_tag}"
+    # Only tag where it disambiguates: convlstm/last and convlstm/max share a
+    # filename otherwise. 'latefusion' is max by definition, so no tag needed.
+    agg_tag      = "_maxlogit" if (args.aggregate == 'max'
+                                   and args.model in ('convlstm', 'convgru')) else ""
+    run_name         = (f"{CFG['model_name']}{agg_tag}{shuffle_tag}{aug_tag}{channels_tag}"
                         f"{loss_tag}{wd_tag}{patience_tag}{bs_tag}{gc_tag}{sched_tag}{seed_tag}")
     best_ckpt_path   = f"outputs/best_{run_name}.pth"
     resume_ckpt_path = f"outputs/resume_{run_name}.pth"
@@ -627,7 +713,11 @@ if __name__ == "__main__":
             lstm_hidden=256,
             num_classes=CFG['num_classes'],
         )
-    elif CFG['model_name'] in ('convlstm', 'convgru'):
+    elif CFG['model_name'] in ('convlstm', 'convgru', 'latefusion'):
+        cell = {'convgru': 'gru', 'latefusion': 'none'}.get(CFG['model_name'], 'lstm')
+        # 'latefusion' has no recurrent state, so max aggregation is the only
+        # coherent choice; the model class enforces this too.
+        aggregate = 'max' if cell == 'none' else CFG['aggregate']
         model = ConvLSTMClassifier(
             backbone='resnet50',
             in_channels_per_frame=n_ch_per_frame,
@@ -635,7 +725,8 @@ if __name__ == "__main__":
             bottleneck_channels=256,
             hidden_channels=128,
             num_classes=CFG['num_classes'],
-            cell='gru' if CFG['model_name'] == 'convgru' else 'lstm',
+            cell=cell,
+            aggregate=aggregate,
         )
     else:
         raise ValueError(f"Unknown model: {CFG['model_name']}")
@@ -755,6 +846,10 @@ if __name__ == "__main__":
             best_f1 = val_metrics['f1']
             epochs_without_improvement = 0
             torch.save(_model_state(model), best_ckpt_path)
+            save_arch_meta(best_ckpt_path, CFG['model_name'],
+                           {'convgru': 'gru', 'latefusion': 'none'}.get(CFG['model_name'], 'lstm'),
+                           'max' if CFG['model_name'] == 'latefusion' else CFG['aggregate'],
+                           CFG['channels'], CFG['timeseries_length'])
             print(f"  Best checkpoint saved (F1={best_f1:.1f}%)\n")
         else:
             epochs_without_improvement += 1
