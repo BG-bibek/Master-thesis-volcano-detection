@@ -369,14 +369,14 @@ class ConvLSTMClassifier(nn.Module):
 # ============================================================================
 
 def create_loaders(data_root, stats_path, shuffle_frames=False, augment=False,
-                   channels='all', seed=42):
+                   channels='all', seed=42, num_workers=4):
     from data_loader_fixed import create_loaders as _create_loaders
     return _create_loaders(
         data_root=data_root,
         stats_path=stats_path,
         timeseries_length=3,
         batch_size=CFG['batch_size'],
-        num_workers=4,  # start at 4; increase if stable, drop to 0 if hangs
+        num_workers=num_workers,  # 4 on the server (Linux fork); 0 on macOS (spawn can't pickle the closures)
         seed=seed,
         shuffle_frames=shuffle_frames,
         augment=augment,
@@ -611,6 +611,9 @@ if __name__ == "__main__":
                         help='Resume from last checkpoint for this run, if it exists')
     parser.add_argument('--checkpoint_every', type=int, default=1,
                         help='Save a resumable checkpoint every N epochs (default: every epoch)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='DataLoader workers (default 4 = unchanged server behaviour). '
+                             'Use 0 on macOS, where spawn cannot pickle the loader closures.')
     args = parser.parse_args()
     print("Args:", args)
 
@@ -680,6 +683,7 @@ if __name__ == "__main__":
         augment=args.augment,
         channels=args.channels,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
 
     # Print shard/sample counts so we know what data is being loaded
@@ -839,6 +843,7 @@ if __name__ == "__main__":
                 'batch_size':     args.batch_size,
                 'gradient_clip':  args.gradient_clip,
                 'lr_schedule':    args.lr_schedule,
+                'aggregate':      'max' if args.model == 'latefusion' else args.aggregate,
                 'history':        history,
             }, f, indent=2)
 
@@ -849,7 +854,7 @@ if __name__ == "__main__":
             save_arch_meta(best_ckpt_path, CFG['model_name'],
                            {'convgru': 'gru', 'latefusion': 'none'}.get(CFG['model_name'], 'lstm'),
                            'max' if CFG['model_name'] == 'latefusion' else CFG['aggregate'],
-                           CFG['channels'], CFG['timeseries_length'])
+                           args.channels, CFG['timeseries_length'])
             print(f"  Best checkpoint saved (F1={best_f1:.1f}%)\n")
         else:
             epochs_without_improvement += 1

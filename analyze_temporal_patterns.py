@@ -35,6 +35,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+try:
+    import scipy.stats  # noqa: F401  - fail here, not after scoring four models
+except ImportError:
+    raise SystemExit("scipy is required for the McNemar tests: "
+                     "/opt/miniconda3/envs/volcano/bin/pip install scipy")
+
 from data_loader_fixed import N_CHANNELS_PER_TIMESTEP
 from evaluate_unseen import (build_model, get_device, infer_channels,
                              infer_model_name, make_loader, unwrap_checkpoint,

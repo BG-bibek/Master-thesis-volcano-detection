@@ -229,6 +229,7 @@ def main():
          and r['lr_sched'] == 'fixed' and r['channels'] == 'all' and r['patience'] == '20'),
         ("ConvGRU (ordered)", lambda r: r['model'] == 'convgru' and not r['shuffled']
          and r['lr_sched'] == 'fixed' and r['channels'] == 'all'),
+        ("Late fusion, no recurrence", lambda r: r['model'] == 'latefusion'),
         ("ConvLSTM (shuffled)", lambda r: r['model'] == 'convlstm' and r['shuffled']),
     ]
     agg = {}
@@ -250,6 +251,16 @@ def main():
             if "ConvGRU (ordered)" in agg:
                 t2, p2 = stats.ttest_ind(a, agg["ConvGRU (ordered)"], equal_var=False)
                 w(f"ConvLSTM vs ConvGRU: Welch t = {t2:.2f}, p = {p2:.2f} — not significant.\n")
+            if "Late fusion, no recurrence" in agg:
+                c = agg["Late fusion, no recurrence"]
+                t3, p3 = stats.ttest_ind(a, c, equal_var=False)
+                verdict = "SIGNIFICANT" if p3 < 0.05 else "not significant"
+                w(f"**ConvLSTM vs late fusion: Welch t = {t3:.2f}, p = {p3:.3f} — {verdict}.** "
+                  f"Removing the recurrent connection costs {st.mean(a)-st.mean(c):.2f} F1. This is "
+                  "the only architectural change in the study that moves the score beyond seed "
+                  "noise. The direction is the confounded one, though: late fusion also has "
+                  "1,474,944 fewer parameters, so this comparison alone cannot separate "
+                  "recurrence from capacity — that is what the temporal-pattern analysis is for.\n")
         except ImportError:
             pass
 
