@@ -51,9 +51,10 @@ PAPER_SINGLE = [
     ("ViT",            "yes", "90.75 ± 1.51", "59.27 ± 7.47", "71.45 ± 5.45", "88.60 ± 3.00"),
 ]
 
-MODEL_ORDER = ['convlstm', 'convgru', 'latefusion', 'cnn_lstm', 'baseline']
+MODEL_ORDER = ['convlstm', 'convgru', 'tsm', 'latefusion', 'cnn_lstm', 'baseline']
 MODEL_LABEL = {'convlstm': 'ConvLSTM', 'convgru': 'ConvGRU',
                'latefusion': 'Late fusion (no recurrence)',
+               'tsm': 'TSM (temporal shift, zero extra params)',
                'cnn_lstm': 'CNN-LSTM', 'baseline': 'Baseline ResNet-50'}
 
 
@@ -79,7 +80,8 @@ def parse_args_line(args):
 def parse_name(run_name):
     """Fallback config recovery when no log exists for a run."""
     n = run_name
-    model = ('latefusion' if 'latefusion' in n else
+    model = ('tsm' if n.startswith('tsm') else
+             'latefusion' if 'latefusion' in n else
              'convgru' if 'convgru' in n else
              'convlstm' if 'convlstm' in n else
              'cnn_lstm' if 'cnn_lstm' in n else

@@ -169,7 +169,7 @@ def resolve_target_layer(model, model_name):
                temporal evolution of spatial attention (the interesting case).
     others   : the encoder's last conv stage, the standard Grad-CAM target.
     """
-    if model_name == 'latefusion':
+    if model_name in ('latefusion', 'tsm'):
         # No recurrent cell exists; the per-timestep spatial projection is the
         # structural analogue and fires once per frame.
         return model.temporal_proj, 'temporal_proj (per-timestep projection)'
@@ -270,7 +270,7 @@ def spatial_entropy(cam):
 # the honest aggregate. Only the final-state arms need 'last'.
 PRIMARY_AGG = {'convlstm': 'last', 'convgru': 'last',
                'cnn_lstm': 'mean', 'baseline': 'mean',
-               'convlstm_max': 'mean', 'latefusion': 'mean'}
+               'convlstm_max': 'mean', 'latefusion': 'mean', 'tsm': 'mean'}
 
 
 def aggregate_cams(cams, how):
@@ -296,15 +296,17 @@ def build_model(model_name, n_ch_per_frame, timeseries_length, num_classes=2):
                                  in_channels_per_frame=n_ch_per_frame,
                                  timeseries_len=timeseries_length,
                                  lstm_hidden=256, num_classes=num_classes)
-    if model_name in ('convlstm', 'convgru', 'convlstm_max', 'latefusion'):
-        cell = {'convgru': 'gru', 'latefusion': 'none'}.get(model_name, 'lstm')
-        aggregate = 'max' if model_name in ('convlstm_max', 'latefusion') else 'last'
+    if model_name in ('convlstm', 'convgru', 'convlstm_max', 'latefusion', 'tsm'):
+        cell = {'convgru': 'gru', 'latefusion': 'none',
+                'tsm': 'none'}.get(model_name, 'lstm')
+        aggregate = 'max' if model_name in ('convlstm_max', 'latefusion', 'tsm') else 'last'
         return ConvLSTMClassifier(backbone='resnet50',
                                   in_channels_per_frame=n_ch_per_frame,
                                   timeseries_len=timeseries_length,
                                   bottleneck_channels=256, hidden_channels=128,
                                   num_classes=num_classes,
-                                  cell=cell, aggregate=aggregate)
+                                  cell=cell, aggregate=aggregate,
+                                  temporal_shift=(model_name == 'tsm'))
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -346,7 +348,7 @@ if __name__ == "__main__":
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--model', required=True,
                     choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru',
-                             'convlstm_max', 'latefusion'])
+                             'convlstm_max', 'latefusion', 'tsm'])
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--channels', default='all', choices=['all', 'core'],
                     help='Must match what the checkpoint was trained with')

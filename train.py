@@ -219,6 +219,77 @@ class ConvGRUCell(nn.Module):
         return (torch.zeros(shape, device=device), torch.zeros(shape, device=device))
 
 
+class TemporalShift(nn.Module):
+    """Temporal Shift Module (Lin et al., ICCV 2019), wrapping one conv.
+
+    Shifts a fraction of channels one step along the TIME axis before the
+    wrapped op runs: the first 1/n_div channels take their values from the
+    next frame, the second 1/n_div from the previous frame, the rest are
+    untouched. A frame therefore sees a slice of its neighbours' features for
+    free — temporal mixing with **zero parameters and zero FLOPs**, which is
+    exactly what makes it a clean control here.
+
+    Why it belongs in this study: it is a third point on the fusion-depth axis
+    we have been probing.
+
+        baseline    all 27 channels fused in conv1          (earliest)
+        TSM         a slice of channels mixed at every block (distributed)
+        ConvLSTM    frames encoded separately, fused after   (late, recurrent)
+        latefusion  frames never interact, max at the end    (none)
+
+    Because TSM adds no parameters, `latefusion` vs `tsm` is a perfectly
+    parameter-matched test of whether cross-frame interaction helps at all —
+    the capacity confound that complicates ConvLSTM vs latefusion simply
+    cannot arise.
+
+    Input is (B*T, C, H, W) with time contiguous within each sample, which is
+    the layout ConvLSTMClassifier.forward already produces.
+    """
+    def __init__(self, net, n_segment=3, n_div=8):
+        super().__init__()
+        self.net = net
+        self.n_segment = n_segment
+        self.n_div = n_div
+
+    def forward(self, x):
+        return self.net(self.shift(x, self.n_segment, self.n_div))
+
+    @staticmethod
+    def shift(x, n_segment, n_div):
+        nt, c, h, w = x.size()
+        assert nt % n_segment == 0, (
+            f"batch {nt} not divisible by n_segment {n_segment}; TSM needs time "
+            "contiguous within each sample")
+        x = x.view(nt // n_segment, n_segment, c, h, w)
+        fold = c // n_div
+        out = torch.zeros_like(x)
+        if fold > 0:
+            out[:, :-1, :fold] = x[:, 1:, :fold]                     # from the next frame
+            out[:, 1:, fold:2 * fold] = x[:, :-1, fold:2 * fold]     # from the previous frame
+        out[:, :, 2 * fold:] = x[:, :, 2 * fold:]                    # unshifted
+        return out.view(nt, c, h, w)
+
+
+def make_temporal_shift(cnn, n_segment=3, n_div=8):
+    """Wrap conv1 of every residual block in a ResNet with a TemporalShift.
+
+    'blockres' placement from the TSM paper: the shift goes on the residual
+    branch, so the identity path is untouched and a pretrained backbone still
+    converges. Returns the number of blocks wrapped.
+    """
+    n = 0
+    for i in range(1, 5):
+        layer = getattr(cnn, f'layer{i}', None)
+        if layer is None:
+            continue
+        for block in layer:
+            block.conv1 = TemporalShift(block.conv1, n_segment=n_segment, n_div=n_div)
+            n += 1
+    if n == 0:
+        raise ValueError("no ResNet blocks found to wrap - is the backbone a ResNet?")
+    return n
+
+
 class ConvLSTMClassifier(nn.Module):
     """Thesis contribution #2: a *true* ConvLSTM (Shi et al., 2015) with a
     ResNet-50 encoder — Thalia's paper reports benchmark numbers for exactly
@@ -251,6 +322,8 @@ class ConvLSTMClassifier(nn.Module):
         pretrained=True,
         cell='lstm',
         aggregate='last',
+        temporal_shift=False,
+        shift_div=8,
     ):
         super().__init__()
         self.T = timeseries_len
@@ -266,6 +339,14 @@ class ConvLSTMClassifier(nn.Module):
             out_indices=(4,),
         )
         cnn_out_channels = self.cnn.feature_info.channels()[-1]  # 2048 for ResNet50
+
+        # TSM: insert zero-parameter temporal mixing inside the encoder. Done
+        # AFTER create_model so the pretrained weights are already loaded and
+        # simply get re-homed under the wrapper.
+        self.temporal_shift = temporal_shift
+        if temporal_shift:
+            self.n_shifted_blocks = make_temporal_shift(
+                self.cnn, n_segment=timeseries_len, n_div=shift_div)
 
         # 1x1 conv to shrink channel count before the ConvLSTM gates — keeps
         # gate-conv params in the same ballpark as CNNLSTMClassifier's LSTM.
@@ -547,11 +628,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',    default='cnn_lstm',
                         choices=['baseline', 'cnn_lstm', 'convlstm', 'convgru',
-                                 'latefusion'],
+                                 'latefusion', 'tsm'],
                         help="'convgru' is 'convlstm' with the ConvLSTM cell swapped for a "
                              "ConvGRU cell (~25%% fewer recurrent params). Everything else — "
                              "encoder, bottleneck, dropout, head — is identical, so the "
                              "comparison isolates the gating mechanism.")
+    parser.add_argument('--shift_div', type=int, default=8,
+                        help="TSM only: 1/shift_div of channels shift forward in "
+                             "time and another 1/shift_div backward (default 8, "
+                             "the value used in the TSM paper). Ignored unless "
+                             "--model tsm.")
     parser.add_argument('--aggregate', default='last', choices=['last', 'max'],
                         help="How the per-timestep hidden states become one "
                              "prediction. 'last' (default) classifies from the "
@@ -717,10 +803,11 @@ if __name__ == "__main__":
             lstm_hidden=256,
             num_classes=CFG['num_classes'],
         )
-    elif CFG['model_name'] in ('convlstm', 'convgru', 'latefusion'):
-        cell = {'convgru': 'gru', 'latefusion': 'none'}.get(CFG['model_name'], 'lstm')
-        # 'latefusion' has no recurrent state, so max aggregation is the only
-        # coherent choice; the model class enforces this too.
+    elif CFG['model_name'] in ('convlstm', 'convgru', 'latefusion', 'tsm'):
+        cell = {'convgru': 'gru', 'latefusion': 'none',
+                'tsm': 'none'}.get(CFG['model_name'], 'lstm')
+        # 'latefusion' and 'tsm' have no recurrent state, so max aggregation is
+        # the only coherent choice; the model class enforces this too.
         aggregate = 'max' if cell == 'none' else CFG['aggregate']
         model = ConvLSTMClassifier(
             backbone='resnet50',
@@ -731,6 +818,8 @@ if __name__ == "__main__":
             num_classes=CFG['num_classes'],
             cell=cell,
             aggregate=aggregate,
+            temporal_shift=(CFG['model_name'] == 'tsm'),
+            shift_div=args.shift_div,
         )
     else:
         raise ValueError(f"Unknown model: {CFG['model_name']}")
@@ -852,8 +941,10 @@ if __name__ == "__main__":
             epochs_without_improvement = 0
             torch.save(_model_state(model), best_ckpt_path)
             save_arch_meta(best_ckpt_path, CFG['model_name'],
-                           {'convgru': 'gru', 'latefusion': 'none'}.get(CFG['model_name'], 'lstm'),
-                           'max' if CFG['model_name'] == 'latefusion' else CFG['aggregate'],
+                           {'convgru': 'gru', 'latefusion': 'none',
+                            'tsm': 'none'}.get(CFG['model_name'], 'lstm'),
+                           'max' if CFG['model_name'] in ('latefusion', 'tsm')
+                           else CFG['aggregate'],
                            args.channels, CFG['timeseries_length'])
             print(f"  Best checkpoint saved (F1={best_f1:.1f}%)\n")
         else:

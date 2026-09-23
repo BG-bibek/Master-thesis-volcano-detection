@@ -79,6 +79,10 @@ def infer_model_name(state_dict):
     """
     keys = set(state_dict.keys())
     if any(k.startswith('temporal_proj.') for k in keys):
+        # TSM wraps every block's conv1, so its weights live one level deeper
+        # at cnn.layerN.M.conv1.net.weight - that is how the two are told apart.
+        if any('.conv1.net.' in k for k in keys):
+            return 'tsm'
         return 'latefusion'          # Arm C: no recurrent cell at all
     if any(k.startswith('conv_lstm.') for k in keys):
         # The GRU cell has a separate candidate conv; the LSTM cell does not.
@@ -153,15 +157,17 @@ def build_model(model_name, n_ch_per_frame, timeseries_length, num_classes=2):
                                  in_channels_per_frame=n_ch_per_frame,
                                  timeseries_len=timeseries_length,
                                  lstm_hidden=256, num_classes=num_classes)
-    if model_name in ('convlstm', 'convgru', 'convlstm_max', 'latefusion'):
-        cell = {'convgru': 'gru', 'latefusion': 'none'}.get(model_name, 'lstm')
-        aggregate = 'max' if model_name in ('convlstm_max', 'latefusion') else 'last'
+    if model_name in ('convlstm', 'convgru', 'convlstm_max', 'latefusion', 'tsm'):
+        cell = {'convgru': 'gru', 'latefusion': 'none',
+                'tsm': 'none'}.get(model_name, 'lstm')
+        aggregate = 'max' if model_name in ('convlstm_max', 'latefusion', 'tsm') else 'last'
         return ConvLSTMClassifier(backbone='resnet50',
                                   in_channels_per_frame=n_ch_per_frame,
                                   timeseries_len=timeseries_length,
                                   bottleneck_channels=256, hidden_channels=128,
                                   num_classes=num_classes,
-                                  cell=cell, aggregate=aggregate)
+                                  cell=cell, aggregate=aggregate,
+                                  temporal_shift=(model_name == 'tsm'))
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -291,7 +297,7 @@ def main():
                          "recompute this on the unseen data.")
     ap.add_argument('--model', default='auto',
                     choices=['auto', 'baseline', 'cnn_lstm', 'convlstm', 'convgru',
-                             'convlstm_max', 'latefusion'])
+                             'convlstm_max', 'latefusion', 'tsm'])
     ap.add_argument('--timeseries_length', type=int, default=3)
     ap.add_argument('--batch_size', type=int, default=8)
     ap.add_argument('--num_workers', type=int, default=0)
